@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.pytest_cache/
+*.egg-info/
+.coverage
+
+# Editor/System
+.DS_Store
+.claude/
+.idea/
+.vscode/
+
+# WorkloadLens Artifacts
+outputs/
+reports/
+comparisons/
+*_png/
+*.jsonl
+*.pdf
+sqlcov.json
+.mplcache/
+
+# Data & Queries (Non-IP)
+queries_*/
+*_schema.sql
+data/
+tests/queries/
+verify_limits.py
+debug_limits.py
+
+# Local Configs
+workloadlens_*.json
+workloadlens.json
+!workloadlens_example.json
+
+# Scripts & Temporary Files
+scripts/copy_latest_comparison_figures.sh
+scripts/debug_*.py
+test.sql
+
+# TPC-DS external data (pulled by install script)
+tpcds-kit/
+
+# Reproducibility data bundle (paper/data/) — commit ONLY the aggregate
+# statistics (signals/) + rendered figures + README. Overrides the data/ ,
+# *.jsonl and *.pdf rules above.
+!paper/data/
+!paper/data/**
+# Kept locally but OUT of git: the raw per-benchmark scans, the raw-regen
+# script, and rebuild output. The signals/ CSVs are the statistics we report.
+paper/data/analyses/
+paper/data/rebuild.sh
+paper/data/_rebuilt/

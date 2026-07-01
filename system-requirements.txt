@@ -1,0 +1,12 @@
+# System dependencies required for building tpcds-kit (dsqgen).
+# WorkloadLens itself only needs Python 3.9+; these are for the C build toolchain.
+#
+# Format: BINARY_NAME | APT_PACKAGE | YUM_PACKAGE | BREW_PACKAGE
+# Lines starting with # are comments.
+
+gcc      | gcc       | gcc       | gcc
+make     | make      | make      | make
+flex     | flex      | flex      | flex
+bison    | bison     | bison     | bison
+git      | git       | git       | git
+python3  | python3   | python3   | python3

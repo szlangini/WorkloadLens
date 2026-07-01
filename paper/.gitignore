@@ -1,0 +1,6 @@
+# Reproducibility working tree — everything regenerable by reproduce.sh.
+# Downloaded data, cloned generators, WorkloadLens outputs and rendered
+# figures all land under work/ and must never be committed.
+work/
+__pycache__/
+*.pyc

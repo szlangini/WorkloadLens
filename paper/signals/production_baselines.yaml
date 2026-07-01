@@ -1,0 +1,246 @@
+# Production-baseline values for WorkloadLens-style signals.
+#
+# Each signal lists one or more `sources` (Snowflake, Amazon Redshift,
+# Tableau). Every source carries the citation, the figure/table it came
+# from, the extraction method, and the percentage values per bucket.
+#
+# When aggregate_signals.py runs, it emits one row per (signal, source)
+# tuple into the per-signal CSVs.
+#
+# ===========================================================================
+# 2026-06-02 PRIMARY-SOURCE AUDIT.  Every value below was re-derived directly
+# from the cited primary paper's figures/tables (not second-hand from the
+# Prod-DS paper's own transcribed bars).  PDFs archived under
+# reports/refs/primary_sources/.  Read off the charts at pixel precision where
+# the source is a CDF (Redshift NULL/MCV).  Key corrections vs. the pre-audit
+# file are noted inline.
+#
+# Type-bucket mapping rule (applied uniformly, == WorkloadLens normalise_type):
+#   INT      <- number / integer / bigint / smallint
+#   TEXT     <- text / varchar / char / string
+#   DECIMAL  <- real / float / double / numeric / decimal
+#   DATE     <- date / timestamp (ntz/tz/ltz) / time / datetime
+#   OTHER    <- boolean / binary / variant / json / geography / ...
+# The type-mix FIGURES then collapse INT+DECIMAL -> NUMBER (paper Fig 3
+# convention), so the INT/DECIMAL split of a NUMBER-only source (Snowflake)
+# is cosmetic; only the NUMBER total, TEXT, DATE, OTHER are load-bearing.
+# ===========================================================================
+#
+# Format:
+#   signals:
+#     <signal_name>:
+#       buckets: [list of bucket labels in column order]
+#       sources:
+#         <label>:
+#           ref:    short citation
+#           paper:  full citation
+#           where:  which figure / table within the PRIMARY paper
+#           method: "table" | "chart-transcribed" | "chart-pixel-extracted"
+#           values: {bucket: percentage}
+#
+# Citations (numbers match the Prod-DS paper's reference list):
+#   [26] Szlang, Bress, et al. Workload Insights from the Snowflake Data
+#        Cloud: What Do Production Analytic Queries Really Look Like?
+#        PVLDB 18(12):5126-5138, 2025.  --> Snowflake operator/query signals.
+#        NOTE: [26] is a QUERY-workload study; it reports NO schema-level
+#        column-type distribution (its Fig 5 is aggregation-INPUT types).
+#   [30] van Renen, Horn, Pfeil, et al. Why TPC Is Not Enough: An Analysis of
+#        the Amazon Redshift Fleet. PVLDB 17(11):3694-3706, 2024 (Redset).
+#        --> Redshift schema types (Table 7), NULL & MCV CDFs (Fig 9),
+#            statement-type mix (Table 2).
+#   [V18] Vogelsgesang, Haubenschild, et al. Get Real: How Benchmarks Fail to
+#        Represent the Real World. DBTest 2018 (Tableau).  --> Fig 1 stored
+#        data-type distribution (used as a SCHEMA-type baseline, not filter).
+#
+# Method legend:
+#   table                  - value taken directly from a published table; precise.
+#   chart-transcribed      - read off a labelled bar chart; +-1-2 pp.
+#   chart-pixel-extracted  - CDF read at pixel precision off the figure; +-2-3 pp.
+
+version: 2
+updated: 2026-06-02
+notes:
+  - "v2 (2026-06-02): full re-audit against the three PRIMARY papers
+    ([26] Snowflake, [30] Redshift/Redset, [V18] Tableau). Replaces the v1
+    values, several of which were materially wrong (notably Snowflake
+    aggregate 85->56 numeric, Snowflake join OTHER 15->2, Redshift MCV
+    share understated by 2-3x, Redshift NULL/schema). See inline notes."
+  - "Snowflake [26] has NO schema column-type distribution -> the schema
+    baseline is Redshift (Table 7) + Tableau (Fig 1). The Prod-DS paper's
+    Fig 7a green 'Snowflake' schema bar actually encoded the Redshift/Snowset
+    53%-text production number, mislabelled."
+  - "Tableau [V18] Fig 1 is a STORED data-type distribution, not a filter
+    breakdown (the paper has no filter-type figure) -> it lives on the schema
+    figure, not filter."
+
+signals:
+
+  # ===== Schema-level column-type distribution (DDL columns) =====
+  # Baselines: Redshift (Redset Table 7 stored columns) + Tableau (Get Real
+  # Fig 1 stored data types).  Snowflake [26] reports no schema types.
+  schema_column_types:
+    description: "Share of columns by logical type in the schema."
+    buckets: [INT, TEXT, DECIMAL, DATE, OTHER]
+    sources:
+      redshift:
+        ref: "Redshift [30]"
+        paper: "van Renen et al., Why TPC Is Not Enough (Redset), PVLDB 17(11):3694, 2024"
+        where: "Table 7 (Stored Columns, Fleet)"
+        method: table
+        # varchar 52.1 + char 1.7 = TEXT 53.8; integer 9.1 + bigint 7.0 +
+        # smallint 2.1 = INT 18.2; numeric 10.2 + double 4.5 + float 0.4 =
+        # DECIMAL 15.1; timestamp 6.2 + date 2.2 + ts_tz 0.4 = DATE 8.8;
+        # boolean 3.9 + json/geo ~0.1 = OTHER 4.0.
+        values: {INT: 18.2, TEXT: 53.8, DECIMAL: 15.1, DATE: 8.8, OTHER: 4.0}
+      tableau:
+        ref: "Tableau [V18]"
+        paper: "Vogelsgesang et al., Get Real, DBTest 2018"
+        where: "Fig 1 (Distribution of data types used)"
+        method: chart-transcribed
+        # Text 48.8, Integer 25.6, Real 20.5, Datetime 2.6, Date 1.5,
+        # Boolean 0.9.  NUMERIC/DECIMAL absent by construction (paper notes
+        # fixed-precision types are missing). Stored-value distribution.
+        values: {INT: 25.6, TEXT: 48.8, DECIMAL: 20.5, DATE: 4.1, OTHER: 0.9}
+
+  # ===== Filter operator: logical type mix =====
+  # Baseline: Snowflake [26] Fig 8 only.  (Tableau moved to schema_column_types
+  # because its Fig 1 is a stored data-type distribution, not a filter mix.)
+  filter_logical_types:
+    description: "Share of filter / predicate column inputs by logical type."
+    buckets: [INT, TEXT, DECIMAL, DATE, OTHER]
+    sources:
+      snowflake:
+        ref: "Snowflake [26]"
+        paper: "Szlang, Bress et al., Workload Insights from the Snowflake Data Cloud, PVLDB 18(12):5126, 2025"
+        where: "Fig 8 (Filter Column Logical Type)"
+        method: chart-transcribed
+        # number 25, text 58, real 2, date 6 + ts_ltz 3 + ts_ntz 3 + ts_tz 0.5
+        # = DATE 12.5, boolean 3.  (was 33/55/0/8/4 pre-audit)
+        values: {INT: 25, TEXT: 58, DECIMAL: 2, DATE: 12.5, OTHER: 3}
+
+  # ===== Join keys: logical type mix =====
+  join_key_logical_types:
+    description: "Share of equi-join keys by logical type."
+    buckets: [INT, TEXT, DECIMAL, DATE, OTHER]
+    sources:
+      snowflake:
+        ref: "Snowflake [26]"
+        paper: "Szlang, Bress et al., Workload Insights from the Snowflake Data Cloud, PVLDB 18(12):5126, 2025"
+        where: "Fig 6 (Join Keys Logical Types)"
+        method: chart-transcribed
+        # text 46, number 39, real 2, date 7 + ts_ntz 3 + ts_ltz 1 = DATE 11,
+        # binary 0.9 + boolean 0.8 = OTHER 1.7.  (was 35/45/0/5/15 pre-audit;
+        # the OTHER=15 was wrong -> true ~2)
+        values: {INT: 39, TEXT: 46, DECIMAL: 2, DATE: 11, OTHER: 1.7}
+
+  # ===== Aggregate inputs: logical type mix =====
+  aggregate_logical_types:
+    description: "Share of aggregate-function inputs by logical type."
+    buckets: [INT, TEXT, DECIMAL, DATE, OTHER]
+    sources:
+      snowflake:
+        ref: "Snowflake [26]"
+        paper: "Szlang, Bress et al., Workload Insights from the Snowflake Data Cloud, PVLDB 18(12):5126, 2025"
+        where: "Fig 5 (Logical Types used by Aggregation Functions)"
+        method: chart-transcribed
+        # number 49, text 34, real 6.7, date 2.9 + ts_ntz 3.0 + ts_tz 1.6 +
+        # ts_ltz 1.0 = DATE 8.5, boolean 1.9.  NUMBER total = 49+6.7 = 55.7.
+        # (was 85/8/0/0/7 pre-audit -- badly wrong, the flagged error)
+        values: {INT: 49, TEXT: 34, DECIMAL: 6.7, DATE: 8.5, OTHER: 1.9}
+
+  # ===== GROUP BY key count per query =====
+  group_by_key_count:
+    description: "Per grouping-operation GROUP BY key count (per group-by operator, matching [26] Table 13)."
+    buckets: ["0", "1-2", "3-5", "6-10", "10+"]
+    sources:
+      snowflake:
+        ref: "Snowflake [26]"
+        paper: "Szlang, Bress et al., Workload Insights from the Snowflake Data Cloud, PVLDB 18(12):5126, 2025"
+        where: "Table 13 (Aggregation Group By Keys)"
+        method: table
+        # exact table.  (was 5/57/30/4/3 pre-audit; 10+ was 3, true 7)
+        values: {"0": 7, "1-2": 53, "3-5": 26, "6-10": 7, "10+": 7}
+
+  # ===== LIMIT magnitude (without ORDER BY) =====
+  limit_magnitude:
+    description: "LIMIT clause magnitude bucket, percent of LIMIT clauses."
+    buckets: ["0", "1-10", "11-100", "101-1K", "1K-10K", "10K-100K", "100K-1M", "1M-10M", ">10M"]
+    sources:
+      snowflake:
+        ref: "Snowflake [26]"
+        paper: "Szlang, Bress et al., Workload Insights from the Snowflake Data Cloud, PVLDB 18(12):5126, 2025"
+        where: "Table 14 (Limit Distribution Without ORDER BY)"
+        method: table
+        # 0:1, 1-10:6, 11-100:3, 101-1K:10, (1K-100K ~0, omitted in Table 14),
+        # 100K-1M:0.7, 1M-10M:71, >10M = 10M-100M 2 + >1B 5 = 7.
+        values:
+          "0": 1
+          "1-10": 6
+          "11-100": 3
+          "101-1K": 10
+          "1K-10K": 0
+          "10K-100K": 0
+          "100K-1M": 0.7
+          "1M-10M": 71
+          ">10M": 7
+
+  # ===== NULL fraction distribution =====
+  # Redshift Redset Fig 9 (right panel: Null fraction), Fleet curve,
+  # pixel-extracted as share-of-columns at each threshold (= 100 - percentile
+  # where the CDF crosses the threshold).
+  null_fraction_distribution:
+    description: "Share of columns whose NULL fraction is >= threshold."
+    buckets: [">=0.01", ">=0.10", ">=0.30", ">=0.50", ">=0.70", ">=0.90"]
+    sources:
+      redshift:
+        ref: "Redshift [30]"
+        paper: "van Renen et al., Why TPC Is Not Enough (Redset), PVLDB 17(11):3694, 2024"
+        where: "Fig 9 right panel (Null fraction), Fleet curve"
+        method: chart-pixel-extracted
+        # (was 35/25/18/13/10/5 pre-audit rough estimate)
+        values:
+          ">=0.01": 25
+          ">=0.10": 20
+          ">=0.30": 16
+          ">=0.50": 13.5
+          ">=0.70": 11
+          ">=0.90": 7
+
+  # ===== MCV share distribution =====
+  # Redshift Redset Fig 9 (middle panel: Maximum MCV frequency = single most
+  # common value fraction), Fleet curve, pixel-extracted.
+  mcv_share_distribution:
+    description: "Share of columns whose max single-value frequency is >= threshold."
+    buckets: [">=0.01", ">=0.10", ">=0.30", ">=0.50", ">=0.70", ">=0.90"]
+    sources:
+      redshift:
+        ref: "Redshift [30]"
+        paper: "van Renen et al., Why TPC Is Not Enough (Redset), PVLDB 17(11):3694, 2024"
+        where: "Fig 9 middle panel (Maximum MCV frequency), Fleet curve"
+        method: chart-pixel-extracted
+        # MAJOR correction: fleet MCV skew was understated 2-3x pre-audit
+        # (was 80/45/25/20/15/8).  True fleet: 41% of columns have one value
+        # in >=50% of rows; 25% at >=90%.
+        values:
+          ">=0.01": 73
+          ">=0.10": 60
+          ">=0.30": 49
+          ">=0.50": 41
+          ">=0.70": 33
+          ">=0.90": 25
+
+  # ===== Statement-type mix =====
+  # Re-sourced (2026-06-02) to the PRIMARY Redset Table 2 fleet numbers
+  # (was RedBench-derived SELECT-73% analytic subset).
+  statement_type_mix:
+    description: "Share of statements by SQL type (full-fleet DML mix)."
+    buckets: [SELECT, INSERT, DELETE, UPDATE, DDL]
+    sources:
+      redshift:
+        ref: "Redshift [30]"
+        paper: "van Renen et al., Why TPC Is Not Enough (Redset), PVLDB 17(11):3694, 2024"
+        where: "Table 2 (Query Types, Fleet column)"
+        method: table
+        # Select 48.9 -> SELECT; Insert 19.5 + Copy 7.4 = INSERT 26.9;
+        # Delete 6.6; Update 3.8; CTAS 1.9 + Maint 8.2 + Other 3.7 = DDL 13.8.
+        values: {SELECT: 48.9, INSERT: 26.9, DELETE: 6.6, UPDATE: 3.8, DDL: 13.8}

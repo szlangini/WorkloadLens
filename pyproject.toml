@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta:__legacy__"
+
+[project]
+name = "WorkloadLens"
+version = "0.1.0"
+description = "Static SQL workload coverage-analysis tool: operator types, join distributions, data profiles."
+authors = [{ name = "Jan Vincent Szlang", email = "jvs34@cam.ac.uk" }]
+readme = "README.md"
+license = { text = "Academic License — non-commercial research and educational use only" }
+requires-python = ">=3.9"
+dependencies = [
+  "duckdb==1.4.1",
+  "sqlglot>=18.0.0",
+  "typer>=0.12.0",
+  "rich>=13.7.0",
+  "matplotlib>=3.8.0",
+  "pandas>=2.1.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.0",
+  "pytest-cov>=4.1",
+]
+
+[project.scripts]
+workloadlens = "workloadlens.cli:app"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,16 @@
+\begin{table}[t]
+  \centering
+  \caption{LIMIT magnitude (no \texttt{ORDER BY}); Prod-DS at SF=100~\cite{snowflake}.}
+  \label{tab:limit-magnitude}
+  \begin{tabular}{lrrrrrrrrr}
+    \toprule
+    Dataset & 0 & 1-10 & 11-100 & 101-1K & 1K-10K & 10K-100K & 100K-1M & 1M-10M & $>$10M \\
+    \midrule
+    TPC-DS & 0 & 0 & 100 & 0 & 0 & 0 & 0 & 0 & 0 \\
+    DSB & 0 & 0 & 100 & 0 & 0 & 0 & 0 & 0 & 0 \\
+    ClickBench & 0 & 100 & 0 & 0 & 0 & 0 & 0 & 0 & 0 \\
+    Snowflake [27] & 1.01 & 6.08 & 3.04 & 10.13 & 0 & 0 & 0.71 & 71.94 & 7.09 \\
+    Prod-DS & 0 & 22.2 & 11.1 & 11.1 & 0 & 0 & 0 & 44.4 & 11.1 \\
+    \bottomrule
+  \end{tabular}
+\end{table}

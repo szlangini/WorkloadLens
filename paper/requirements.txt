@@ -1,0 +1,5 @@
+# Extra Python dependencies for the paper-figure pipeline, on top of the
+# WorkloadLens package itself (installed from the repo root: `pip install -e .`).
+# WorkloadLens already pulls in matplotlib + pandas; the figure aggregator also
+# needs a YAML parser for the production-baseline table.
+PyYAML>=6.0

@@ -1,0 +1,10 @@
+{
+  "schema": "schema.sql",
+  "queries": "queries/*.sql",
+  "data_dir": "/path/to/data",
+  "output_dir": "outputs/my_workload",
+  "coverage_json": "coverage/coverage.jsonl",
+  "data_json": "data/data_metrics.jsonl",
+  "report_pdf": "reports/workloadlens_report.pdf",
+  "scope": "queries"
+}
