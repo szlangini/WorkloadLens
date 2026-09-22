@@ -21,6 +21,8 @@ The default WorkloadLens pipeline is *not* touched by this module. To use it::
 
 from __future__ import annotations
 
+import os
+
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -733,92 +735,473 @@ def apply_paper_style() -> None:
     })
 
 
+# ── Figure titles ───────────────────────────────────────────────
+# Figure-level headers are ON by default, because a WorkloadLens plot is usually read
+# on its own -- in a report, a slide, a terminal -- where nothing else says what it
+# shows. Reviewer D3(d) of the July 2026 round objected to headers only in the paper's
+# figures, which sit under LaTeX captions that already name them; that is the exception,
+# and paper/signals/render_paper_figures.py turns them off for itself rather than
+# imposing the paper's convention on every caller. `PLOT_TITLES=0` (also `false`, `no`,
+# `off`) suppresses them anywhere. Panel labels inside a small-multiple grid are NOT
+# affected either way: they name which signal a panel shows and are content, not a
+# repetition of a caption.
+_TITLE_TRUTHY = {"1", "true", "yes", "on"}
+_TITLE_FALSY = {"0", "false", "no", "off"}
+# PLOT_LEGACY_STYLE=1 renders the figures the way they looked before the July 2026
+# review round: in-plot titles on, curves separated by colour alone. It exists so the
+# same data can be shown in the old and the new style side by side; it is never used
+# for the paper itself.
+LEGACY_STYLE: bool = os.environ.get("PLOT_LEGACY_STYLE", "0").strip().lower() in _TITLE_TRUTHY
+SHOW_FIGURE_TITLES: bool = (
+    LEGACY_STYLE or os.environ.get("PLOT_TITLES", "1").strip().lower() not in _TITLE_FALSY
+)
+
+
+def set_figure_titles_enabled(flag: bool) -> None:
+    """Override the PLOT_TITLES default for this process.
+
+    A caller that always wants one behaviour -- the paper renderer, which has captions --
+    sets it here instead of relying on the ambient default.
+    """
+    global SHOW_FIGURE_TITLES
+    SHOW_FIGURE_TITLES = bool(flag)
+
+
+def set_figure_title(target: Any, text: Optional[str], **kwargs: Any) -> None:
+    """Draw a figure-level header only when titles are enabled (see PLOT_TITLES)."""
+    if not text or not SHOW_FIGURE_TITLES:
+        return
+    setter = getattr(target, "set_title", None) or getattr(target, "suptitle")
+    setter(text, **kwargs)
+
+
 def _line_style_for(label: str) -> str:
     return "--" if label in BASELINE_LABELS else "-"
+
+
+# Reviewer D9 of the July 2026 round: "The legend of Figure 3 includes JOB, but
+# it is difficult to identify the corresponding curve in the figure." The eight
+# benchmark curves used to differ by colour alone, which fails in greyscale, for
+# colour-vision deficiency, and whenever two curves run close together. Each
+# series now carries a distinct dash pattern AND a distinct sparse marker, so a
+# reader can match legend to curve on shape alone.
+# ``phase`` staggers each series' markers along the curve so that two benchmarks
+# running on top of each other (JOB and RedBench do, over the last third of the
+# MCV curve) still show their own symbols instead of stacking them at the same x.
+CURVE_STYLES: Dict[str, Dict[str, Any]] = {
+    # bench            dash pattern (on, off, ...)           marker  phase
+    "PRODDS":     {"dashes": (None, None),                   "marker": "o", "phase": 0.02},
+    "TPCDS":      {"dashes": (None, None),                   "marker": "s", "phase": 0.04},
+    "TPCH":       {"dashes": (3.2, 1.3),                     "marker": "^", "phase": 0.06},
+    "DSB":        {"dashes": (1.3, 1.3),                     "marker": "D", "phase": 0.08},
+    "CLICKBENCH": {"dashes": (4.5, 1.3, 1.0, 1.3),           "marker": "v", "phase": 0.10},
+    "JOB":        {"dashes": (5.5, 1.5, 1.0, 1.5, 1.0, 1.5), "marker": "P", "phase": 0.12},
+    "REDBENCH":   {"dashes": (2.4, 1.2),                     "marker": "X", "phase": 0.14},
+    "JCCH":       {"dashes": (1.0, 1.0),                     "marker": "*", "phase": 0.16},
+}
+# Production baselines stay marker-free: they are reference lines, not benchmarks,
+# and the dashed-without-marker look keeps that distinction readable at a glance.
+_BASELINE_CURVE_STYLE: Dict[str, Any] = {"dashes": (4.0, 1.6), "marker": None}
+
+
+def curve_style_for(label: str, *, markevery: float = 0.16) -> Dict[str, Any]:
+    """Line kwargs that identify a series by shape as well as by colour.
+
+    Returns ``dashes``/``marker`` (plus marker sizing) for the benchmark or
+    baseline named by ``label``; unknown labels fall back to a plain solid line.
+    """
+    if LEGACY_STYLE:
+        return {}
+    key = _norm_label(label)
+    if label in BASELINE_LABELS or key in {_norm_label(b) for b in BASELINE_LABELS}:
+        style = dict(_BASELINE_CURVE_STYLE)
+    else:
+        style = dict(CURVE_STYLES.get(key, {"dashes": (None, None), "marker": None}))
+    out: Dict[str, Any] = {}
+    dashes = style.get("dashes")
+    if dashes and dashes[0] is not None:
+        out["dashes"] = dashes
+    marker = style.get("marker")
+    if marker:
+        out.update({
+            "marker": marker,
+            "markersize": 4.6 if marker == "*" else 4.0,
+            # (start, stride) as fractions of the curve length: the per-series
+            # start phase keeps overlapping curves' markers from coinciding.
+            "markevery": (float(style.get("phase", 0.02)), markevery),
+            # A thin light rim keeps a marker readable where another curve is
+            # drawn over it (reviewer D9: JOB was hidden under RedBench).
+            "markeredgecolor": "white",
+            "markeredgewidth": 0.6,
+            "fillstyle": "full",
+        })
+    return out
+
+
+# Explanatory legend notes ("Omitted, all-zero: …", "★ reported in production") are set
+# smaller than the series labels and wrapped to the width of the label grid, so a note can
+# never widen the legend box over a curve. 0.85 is the top of the 80-85% band the author
+# asked for -- these figures are typeset at ~0.51x, so every point of note size counts.
+_NOTE_SCALE: float = 0.85
+
+# Tried in order when a caller asks for automatic placement; the first location whose whole
+# box (background included) clears every curve wins, so the requested location still comes
+# first and only moves when it would cover data.
+_LEGEND_LOC_CANDIDATES: Tuple[str, ...] = (
+    "upper left", "upper right", "lower left", "lower right",
+    "center left", "center right", "upper center", "lower center", "center",
+)
+
+
+def _text_width_px(fig, rend, text: str, fontsize: float) -> float:
+    """Width of ``text`` in display pixels at ``fontsize``, measured, not estimated."""
+    probe = fig.text(0.0, 0.0, text, fontsize=fontsize)
+    try:
+        return float(probe.get_window_extent(rend).width)
+    finally:
+        probe.remove()
+
+
+def _wrap_to_width(fig, rend, text: str, fontsize: float, max_px: float) -> List[str]:
+    """Greedy wrap of one paragraph to ``max_px``, then pull back a single-word orphan.
+
+    A word wider than the budget is kept on its own line rather than dropped: the caller's
+    width is a layout target, not a hard clip.
+    """
+    words = text.split()
+    if not words:
+        return []
+    lines: List[str] = []
+    current = ""
+    for word in words:
+        trial = f"{current} {word}".strip()
+        if not current or _text_width_px(fig, rend, trial, fontsize) <= max_px:
+            current = trial
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    # Orphan: a last line holding one word reads as a typesetting accident. Pull a word down
+    # from the line above when the result still fits.
+    if len(lines) >= 2 and len(lines[-1].split()) == 1:
+        head = lines[-2].split()
+        if len(head) >= 2:
+            moved = head.pop()
+            candidate = f"{moved} {lines[-1]}"
+            if _text_width_px(fig, rend, candidate, fontsize) <= max_px:
+                lines[-2], lines[-1] = " ".join(head), candidate
+    return lines
+
+
+def _curve_cloud(ax):
+    """Every plotted curve as a densified point cloud in axes coordinates, cached per axes.
+
+    Densifying once and testing points is both simpler and far faster than clipping segments
+    against thousands of candidate rectangles, and 0.004 axes units is finer than any line
+    width at these figure sizes, so nothing slips between samples.
+    """
+    import numpy as np  # noqa: WPS433
+
+    cached = ax.__dict__.get("_wl_curve_cloud")
+    if cached is not None:
+        return cached
+    to_axes = (ax.transData + ax.transAxes.inverted()).transform
+    step = 0.004
+    pts_all, owner_all = [], []
+    for idx, line in enumerate(ax.lines):
+        if not line.get_visible():
+            continue
+        xs, ys = np.asarray(line.get_xdata(), float), np.asarray(line.get_ydata(), float)
+        if xs.size == 0:
+            continue
+        pts = np.asarray(to_axes(np.column_stack([xs, ys])), float)
+        dense = [pts[:1]]
+        for i in range(1, len(pts)):
+            a, b = pts[i - 1], pts[i]
+            n = int(max(abs(b[0] - a[0]), abs(b[1] - a[1])) / step)
+            if n > 1:
+                t = np.linspace(0.0, 1.0, min(n, 4000) + 1)[1:, None]
+                dense.append(a + (b - a) * t)
+            else:
+                dense.append(b[None, :])
+        pts = np.vstack(dense)
+        pts_all.append(pts)
+        owner_all.append(np.full(len(pts), idx, dtype=int))
+    if not pts_all:
+        cloud = (np.zeros((0, 2)), np.zeros(0, dtype=int))
+    else:
+        cloud = (np.vstack(pts_all), np.concatenate(owner_all))
+    ax.__dict__["_wl_curve_cloud"] = cloud
+    return cloud
+
+
+def _legend_overlap_score(ax, rect) -> float:
+    """How many plotted curves the legend box would cover, in axes coordinates.
+
+    Counts CURVES first, not points: the thing to avoid is hiding a series at all, so a box
+    grazing two lines is worse than one sitting on a single line for longer. The point term
+    only breaks ties between placements that cover the same number of curves.
+    """
+    import numpy as np  # noqa: WPS433
+
+    score = 0.0
+    # Bars are areas, not polylines: test them as rectangles so the score means the same
+    # thing on a grouped-bar figure as on a CDF. Visible labels and marker scatters count
+    # too — a legend box over a rotated "80" hides data just as effectively as one over a
+    # curve, and that is what the LIMIT panel's note was sitting on.
+    fig = ax.figure
+    fig.canvas.draw()
+    rend = fig.canvas.get_renderer()
+    inv = ax.transAxes.inverted()
+    for txt in ax.texts:
+        if not txt.get_visible() or not txt.get_text().strip():
+            continue
+        bb = txt.get_window_extent(rend).transformed(inv)
+        if bb.x0 < rect[2] and bb.x1 > rect[0] and bb.y0 < rect[3] and bb.y1 > rect[1]:
+            score += 1.0
+    for coll in ax.collections:
+        if not coll.get_visible():
+            continue
+        try:
+            bb = coll.get_window_extent(rend).transformed(inv)
+        except Exception:                                        # noqa: BLE001
+            continue
+        if bb.x0 < rect[2] and bb.x1 > rect[0] and bb.y0 < rect[3] and bb.y1 > rect[1]:
+            score += 1.0
+    to_axes = (ax.transData + ax.transAxes.inverted()).transform
+    for patch in ax.patches:
+        if type(patch).__name__ != "Rectangle" or not patch.get_visible():
+            continue
+        (bx0, by0), (bx1, by1) = to_axes([
+            (patch.get_x(), patch.get_y()),
+            (patch.get_x() + patch.get_width(), patch.get_y() + patch.get_height()),
+        ])
+        if (min(bx0, bx1) < rect[2] and max(bx0, bx1) > rect[0]
+                and min(by0, by1) < rect[3] and max(by0, by1) > rect[1]):
+            score += 1.0
+
+    pts, owners = _curve_cloud(ax)
+    if len(pts) == 0:
+        return score
+    inside = ((pts[:, 0] >= rect[0]) & (pts[:, 0] <= rect[2])
+              & (pts[:, 1] >= rect[1]) & (pts[:, 1] <= rect[3]))
+    if not inside.any():
+        return score
+    hit_curves = int(np.unique(owners[inside]).size)
+    return score + hit_curves + min(int(inside.sum()), 999) / 1000.0
+
+
+def _clear_anchor_for_box(ax, width: float, height: float, prefer):
+    """Slide a box of this size over the axes and return the emptiest upper-left anchor.
+
+    Named corners are where a legend belongs, and they are tried first by the caller. This is
+    the fallback for a plot like the MCV CDF where every corner has a curve in it: scan the
+    whole area on a fine grid, keep the positions that cover nothing, and among those take the
+    one nearest the position the figure asked for. Returns ``None`` when nothing is clear.
+    """
+    import numpy as np  # noqa: WPS433
+
+    margin = 0.012
+    step = 0.01
+    xs = np.arange(margin, max(margin, 1.0 - margin - width) + 1e-9, step)
+    ys = np.arange(margin + height, min(1.0 - margin, 1.0) + 1e-9, step)
+    if xs.size == 0 or ys.size == 0:
+        return None
+    best, best_cost = None, None
+    for x0 in xs:
+        for y_top in ys:
+            rect = (x0, y_top - height, x0 + width, y_top)
+            if _legend_overlap_score(ax, rect) > 0.0:
+                continue
+            cost = (x0 - prefer[0]) ** 2 + (y_top - prefer[1]) ** 2
+            if best_cost is None or cost < best_cost:
+                best, best_cost = (float(x0), float(y_top)), cost
+    return best
 
 
 def _legend_with_isolated_note(
     ax,
     handles: Sequence[Any],
     labels: Sequence[str],
-    note: str,
+    note: Any,
     *,
     loc: str,
     ncol: int,
     note_marker: Optional[str] = None,
     fontsize: Optional[float] = None,
     note_fontsize: Optional[float] = None,
+    note_scale: float = _NOTE_SCALE,
+    auto_place: bool = False,
 ) -> None:
-    """Draw the entry grid plus ``note`` on its OWN isolated last line.
+    """Draw the entry grid plus ``note`` as a smaller, wrapped block beneath it.
 
-    matplotlib fills legends column-major, so an explanatory note appended as a
-    normal entry lands awkwardly beside an unrelated label. Instead we render
-    two frameless legends — the bench grid, then the note pinned just beneath it
-    — and wrap both in a single rounded white box so the note reads as the
-    legend's last line rather than a grid cell.
+    matplotlib fills legends column-major, so an explanatory note appended as a normal entry
+    lands awkwardly beside an unrelated label. Instead we render two frameless legends -- the
+    bench grid, then the note pinned just beneath it -- and wrap both in a single rounded
+    white box so the note reads as the legend's last line rather than a grid cell.
+
+    ``note`` is one string or a sequence of paragraphs, each starting on its own line. Notes
+    are set at ``note_scale`` of the grid's font size and wrapped to the width of the grid
+    **measured without them**, so an explanation can lengthen the box but never widen it.
+
+    With ``auto_place`` the finished box -- background included -- is tested against every
+    curve at each candidate location, and the first one that covers nothing wins. ``loc`` is
+    tried first, so a figure only moves its legend when the requested corner sits on data.
     """
     from matplotlib.lines import Line2D  # noqa: WPS433
     from matplotlib.patches import FancyBboxPatch  # noqa: WPS433
 
-    # borderaxespad insets the grid from the axes edge so the wrapping box
-    # keeps a tiny margin off the right/left spine instead of sitting on it.
-    main_kw: Dict[str, Any] = dict(
-        loc=loc, ncol=ncol, frameon=False, fancybox=True,
-        handlelength=1.2, handletextpad=0.4, borderpad=0.4,
-        labelspacing=0.3, columnspacing=1.0, borderaxespad=1.0,
-    )
-    if fontsize is not None:
-        main_kw["fontsize"] = fontsize
-    leg_main = ax.legend(list(handles), list(labels), **main_kw)
-    ax.add_artist(leg_main)
-
+    paragraphs = [note] if isinstance(note, str) else [p for p in note if p]
     fig = ax.figure
     fig.canvas.draw()
     rend = fig.canvas.get_renderer()
-    inv = ax.transAxes.inverted()
-    bb_disp = leg_main.get_window_extent(rend)
-    main_fs = leg_main._fontsize
-    pad_px = leg_main.borderpad * main_fs * fig.dpi / 72.0
-    row_gap_px = 0.3 * main_fs * fig.dpi / 72.0
-    # Pin the note flush under the last grid row: align x with the grid's
-    # content (inside the left pad) and pull y up so only one normal row-gap
-    # separates it — kills the double border-pad gap that made the note read
-    # like it sat on a wasted second line.
-    anchor_x = bb_disp.x0 + pad_px
-    anchor_y = bb_disp.y0 + pad_px - row_gap_px
-    ax_ax, ax_ay = inv.transform((anchor_x, anchor_y))
 
-    if note_marker:
-        note_handle = Line2D([], [], linestyle="none", marker=note_marker,
-                             markersize=8, markerfacecolor="#1A1A1A",
-                             markeredgecolor="white", markeredgewidth=0.3)
-        hl, htp = 1.2, 0.4
-    else:
-        note_handle = Line2D([], [], linestyle="none", marker="none")
-        hl, htp = 0.0, 0.0
+    def build(place: Any) -> Dict[str, Any]:
+        # borderaxespad insets the grid from the axes edge so the wrapping box keeps a tiny
+        # margin off the spine instead of sitting on it. ``place`` is either one of
+        # matplotlib's location names or an explicit (x, y_top) anchor in axes coordinates.
+        main_kw: Dict[str, Any] = dict(
+            ncol=ncol, frameon=False, fancybox=True,
+            handlelength=1.2, handletextpad=0.4, borderpad=0.4,
+            labelspacing=0.3, columnspacing=1.0,
+        )
+        box_tr = ax.transAxes
+        if isinstance(place, str):
+            main_kw.update(loc=place, borderaxespad=1.0)
+        else:
+            main_kw.update(loc="upper left", borderaxespad=0.0,
+                           bbox_to_anchor=tuple(place), bbox_transform=ax.transAxes)
+        if fontsize is not None:
+            main_kw["fontsize"] = fontsize
+        leg_main = ax.legend(list(handles), list(labels), **main_kw)
+        ax.add_artist(leg_main)
 
-    note_kw: Dict[str, Any] = dict(
-        loc="upper left", bbox_to_anchor=(ax_ax, ax_ay),
-        bbox_transform=ax.transAxes, frameon=False,
-        handlelength=hl, handletextpad=htp, borderpad=0.0,
-    )
-    note_kw["fontsize"] = note_fontsize if note_fontsize is not None else (fontsize or 8)
-    leg_note = ax.legend([note_handle], [note], **note_kw)
+        fig.canvas.draw()
+        inv = box_tr.inverted()
+        bb_disp = leg_main.get_window_extent(rend)
+        main_fs = leg_main._fontsize
+        px_per_pt = fig.dpi / 72.0
+        pad_px = leg_main.borderpad * main_fs * px_per_pt
+        row_gap_px = 0.3 * main_fs * px_per_pt
+        note_fs = note_fontsize if note_fontsize is not None else round(main_fs * note_scale, 2)
 
-    fig.canvas.draw()
-    bb1 = leg_main.get_window_extent(rend).transformed(inv)
-    bb2 = leg_note.get_window_extent(rend).transformed(inv)
-    x0, x1 = min(bb1.x0, bb2.x0), max(bb1.x1, bb2.x1)
-    y0, y1 = min(bb1.y0, bb2.y0), max(bb1.y1, bb2.y1)
-    pad = 0.010
-    patch = FancyBboxPatch(
-        (x0 - pad, y0 - pad), (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad,
-        transform=ax.transAxes,
-        boxstyle="round,pad=0,rounding_size=0.015",
-        facecolor="white", edgecolor="#bbbbbb",
-        linewidth=0.8, zorder=4.0, mutation_aspect=1.0,
-    )
-    ax.add_patch(patch)
+        # The budget is the grid's own content width -- the box as it stands WITHOUT any note.
+        avail_px = bb_disp.width - 2 * pad_px
+        hl, htp = (1.2, 0.4) if note_marker else (0.0, 0.0)
+        if note_marker:
+            avail_px -= (hl + htp) * note_fs * px_per_pt
+        lines: List[str] = []
+        for para in paragraphs:
+            lines.extend(_wrap_to_width(fig, rend, para, note_fs, avail_px))
+        if os.environ.get("WL_LEGEND_DEBUG"):
+            print(f"[legend] place={place} grid_px={bb_disp.width:.1f} pad={pad_px:.1f} "
+                  f"avail={avail_px:.1f} main_fs={main_fs} note_fs={note_fs} "
+                  f"lines={lines}", flush=True)
+
+        artists: List[Any] = [leg_main]
+        if lines:
+            # Pin the note flush under the last grid row: align x with the grid's content
+            # (inside the left pad) and pull y up so only one normal row-gap separates it.
+            anchor = inv.transform((bb_disp.x0 + pad_px, bb_disp.y0 + pad_px - row_gap_px))
+            if note_marker:
+                note_handle = Line2D([], [], linestyle="none", marker=note_marker,
+                                     markersize=8, markerfacecolor="#1A1A1A",
+                                     markeredgecolor="white", markeredgewidth=0.3)
+            else:
+                note_handle = Line2D([], [], linestyle="none", marker="none")
+            leg_note = ax.legend(
+                [note_handle], ["\n".join(lines)],
+                loc="upper left", bbox_to_anchor=(anchor[0], anchor[1]),
+                bbox_transform=box_tr, frameon=False,
+                handlelength=hl, handletextpad=htp, borderpad=0.0,
+                labelspacing=0.3, fontsize=note_fs,
+            )
+            artists.append(leg_note)
+
+        fig.canvas.draw()
+        boxes = [a.get_window_extent(rend).transformed(inv) for a in artists]
+        x0 = min(b.x0 for b in boxes)
+        x1 = max(b.x1 for b in boxes)
+        y0 = min(b.y0 for b in boxes)
+        y1 = max(b.y1 for b in boxes)
+        pad = 0.010
+        rect = (x0 - pad, y0 - pad, x1 + pad, y1 + pad)
+        patch = FancyBboxPatch(
+            (rect[0], rect[1]), rect[2] - rect[0], rect[3] - rect[1],
+            transform=box_tr,
+            boxstyle="round,pad=0,rounding_size=0.015",
+            facecolor="white", edgecolor="#bbbbbb",
+            linewidth=0.8, zorder=4.0, mutation_aspect=1.0,
+        )
+        patch.set_clip_on(False)
+        ax.add_patch(patch)
+        artists.append(patch)
+
+        def destroy() -> None:
+            for artist in artists:
+                artist.remove()
+            if ax.legend_ in artists:
+                ax.legend_ = None
+
+        return {"rect": rect, "destroy": destroy, "loc": place}
+
+    order = ((loc,) + tuple(c for c in _LEGEND_LOC_CANDIDATES if c != loc)
+             if auto_place else (loc,))
+
+    best: Optional[Dict[str, Any]] = None
+    for candidate in order:
+        built = build(candidate)
+        built["score"] = _legend_overlap_score(ax, built["rect"])
+        if best is None or built["score"] < best["score"]:
+            if best is not None:
+                best["destroy"]()
+            best = built
+        else:
+            built["destroy"]()
+        if best["score"] <= 0.0:
+            break
+
+    if auto_place and best is not None and best["score"] > 0.0:
+        # No named corner is clear -- the MCV CDF is full from corner to corner. Slide a box
+        # of exactly this size over the whole axes and take the emptiest spot near the corner
+        # the figure asked for. Anchoring is approximate (the legend's own padding shifts it),
+        # so re-anchor once against the measured offset before accepting the result.
+        x0, y0, x1, y1 = best["rect"]
+        w, h = x1 - x0, y1 - y0
+        loc_name = str(loc)
+        prefer_x = (0.0 if "left" in loc_name
+                    else (1.0 - w if "right" in loc_name else 0.5 - w / 2))
+        prefer_y = (1.0 if "upper" in loc_name
+                    else (h if "lower" in loc_name else 0.5 + h / 2))
+        prefer = (prefer_x, prefer_y)
+        anchor = _clear_anchor_for_box(ax, w, h, prefer)
+        if anchor is not None:
+            for _ in range(2):
+                candidate_build = build(anchor)
+                rect = candidate_build["rect"]
+                dx, dy = anchor[0] - rect[0], anchor[1] - rect[3]
+                if abs(dx) < 1e-4 and abs(dy) < 1e-4:
+                    break
+                candidate_build["destroy"]()
+                anchor = (anchor[0] + dx, anchor[1] + dy)
+            else:
+                candidate_build = build(anchor)
+            candidate_build["score"] = _legend_overlap_score(ax, candidate_build["rect"])
+            if candidate_build["score"] < best["score"]:
+                best["destroy"]()
+                best = candidate_build
+            else:
+                candidate_build["destroy"]()
+
+    if best is not None:
+        ax.__dict__.setdefault("_wl_legend_placements", []).append(
+            {"loc": best["loc"], "rect": best["rect"], "score": best["score"]})
+        if os.environ.get("WL_LEGEND_DEBUG"):
+            cloud = _curve_cloud(ax)[0]
+            print(f"[legend] CHOSEN loc={best['loc']} rect="
+                  f"{[round(float(v), 3) for v in best['rect']]} score={best['score']} "
+                  f"cloud={len(cloud)} pts", flush=True)
 
 
 def draw_horizontal_stacked_bars(
@@ -888,7 +1271,7 @@ def draw_horizontal_stacked_bars(
     else:
         ax.set_xticks([])
     if title:
-        ax.set_title(title, pad=4)
+        set_figure_title(ax, title, pad=4)
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
     ax.xaxis.grid(True, linestyle="-", linewidth=0.3, alpha=0.4, color="#888888")
@@ -916,13 +1299,21 @@ def draw_multi_line_cdf(
     legend_loc: str = "upper left",
     legend_ncol: int = 2,
     legend_fontsize: Optional[float] = None,
-    extra_legend_note: Optional[str] = None,
+    note_fontsize: Optional[float] = None,
+    extra_legend_note: Any = None,
 ) -> None:
     """Plot multiple percentile curves. Baseline labels are auto-dashed.
 
-    ``extra_legend_note`` adds one borderless text-only row to the legend box
-    (handle drawn invisibly) — used to fold the "Omitted (all-zero): …" note
-    into the legend instead of floating it as a separate annotation.
+    ``extra_legend_note`` adds a borderless text-only block to the legend box (handle drawn
+    invisibly) — used to fold the "Omitted, all-zero: …" notes into the legend instead of
+    floating them as a separate annotation. It is one string or a sequence of paragraphs,
+    each starting on its own line; every paragraph is set smaller than the series labels and
+    wrapped to the width of the label grid, so a note lengthens the box but never widens it.
+    The finished box is then placed where it covers no curve.
+
+    ``note_fontsize`` overrides that 85 % rule with an absolute size. The MCV panel uses it to
+    carry the same note size as the NULL panel beside it in Figure 6, which its own smaller
+    series labels would otherwise scale away.
     """
     if not series:
         ax.set_axis_off()
@@ -937,6 +1328,7 @@ def draw_multi_line_cdf(
             color=_color_for(label),
             linestyle=_line_style_for(label),
             linewidth=1.8 if label in BASELINE_LABELS else 1.6,
+            **curve_style_for(label),
         )
     ax.set_xlim(0, 100)
     ax.set_ylim(0, 100)
@@ -945,7 +1337,7 @@ def draw_multi_line_cdf(
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     if title:
-        ax.set_title(title, pad=6)
+        set_figure_title(ax, title, pad=6)
     ax.grid(True, linestyle=":", linewidth=0.4, alpha=0.5, color="#aaaaaa")
     ax.set_axisbelow(True)
     # Paper-style: keep all 4 spines
@@ -959,7 +1351,8 @@ def draw_multi_line_cdf(
             _legend_with_isolated_note(
                 ax, handles, labels, extra_legend_note,
                 loc=legend_loc, ncol=legend_ncol, note_marker=None,
-                fontsize=legend_fontsize, note_fontsize=8,
+                fontsize=legend_fontsize, note_fontsize=note_fontsize,
+                auto_place=True,
             )
         else:
             legend_kwargs = dict(
@@ -1002,7 +1395,7 @@ def draw_distance_bars(
     ax.set_xticklabels(list(benchmarks), rotation=0, ha="center")
     ax.set_ylabel(ylabel)
     if title:
-        ax.set_title(title, pad=6)
+        set_figure_title(ax, title, pad=6)
     ax.yaxis.grid(True, linestyle=":", linewidth=0.4, alpha=0.5, color="#aaaaaa")
     ax.set_axisbelow(True)
     for spine in ax.spines.values():
@@ -1049,12 +1442,15 @@ def draw_distance_small_multiple(
     # strength + hatched so "our solution" is the focal point in every panel —
     # the eye reads at a glance that the orange bar is consistently short
     # (= close to production) across signals.
-    span = (x_max if x_max else (max(vals) if vals else 1.0)) or 1.0
+    _finite = [v for v in vals if v == v]          # v != v  <=> NaN gap
+    span = (x_max if x_max else (max(_finite) if _finite else 1.0)) or 1.0
     if highlight in benches:
         h_idx = benches.index(highlight)
         ax.axhspan(h_idx - 0.5, h_idx + 0.5, color=_color_for(highlight),
                    alpha=0.13, zorder=0)
     for i, (bench, val) in enumerate(zip(benches, vals)):
+        if val != val:      # NaN = signal not measurable for this benchmark
+            continue
         is_h = bench == highlight
         ax.barh(
             i, val,
@@ -1118,7 +1514,11 @@ def draw_distance_radar(
     theta = np.linspace(0, 2 * np.pi, n_signals, endpoint=False).tolist()
     theta_closed = theta + [theta[0]]
     for i, bench in enumerate(benchmarks):
-        values = [max_distance - max(0.0, min(max_distance, float(distances[i][j]))) for j in range(n_signals)]
+        values = [
+            max_distance - max(0.0, min(max_distance, float(distances[i][j])))
+            if distances[i][j] == distances[i][j] else float("nan")
+            for j in range(n_signals)
+        ]
         values.append(values[0])
         ax.plot(theta_closed, values, color=_color_for(bench), linewidth=1.2, label=bench,
                 linestyle=_line_style_for(bench))
@@ -1130,7 +1530,7 @@ def draw_distance_radar(
     ax.set_rlabel_position(180 / n_signals)
     ax.set_ylim(0, max_distance)
     if title:
-        ax.set_title(title, pad=14)
+        set_figure_title(ax, title, pad=14)
     ax.legend(
         loc="lower center",
         bbox_to_anchor=(0.5, -0.18),
@@ -1158,7 +1558,10 @@ def draw_distance_heatmap(
     """
     import numpy as np  # noqa: WPS433
     data = np.asarray(distances, dtype=float)
-    im = ax.imshow(data, cmap="RdYlGn_r", vmin=0, vmax=vmax, aspect="auto")
+    import matplotlib as _mpl
+    _cmap = _mpl.colormaps["RdYlGn_r"].with_extremes(bad="#f2f2f2")
+    im = ax.imshow(np.ma.masked_invalid(np.asarray(data, dtype=float)),
+                   cmap=_cmap, vmin=0, vmax=vmax, aspect="auto")
     ax.set_xticks(range(len(signal_labels)))
     ax.set_xticklabels(list(signal_labels), rotation=30, ha="right", fontsize=7.5)
     ax.set_yticks(range(len(benchmarks)))
@@ -1173,11 +1576,16 @@ def draw_distance_heatmap(
     ax.tick_params(which="minor", length=0)
     for i in range(data.shape[0]):
         for j in range(data.shape[1]):
-            ax.text(j, i, f"{data[i, j]:.0f}", ha="center", va="center",
+            value = data[i, j]
+            if value != value:        # NaN = signal not measurable for this row
+                ax.text(j, i, "–", ha="center", va="center",
+                        fontsize=6.5, color="#888888")
+                continue
+            ax.text(j, i, f"{value:.0f}", ha="center", va="center",
                     fontsize=6.5,
-                    color="white" if data[i, j] > vmax * 0.55 else "#1a1a1a")
+                    color="white" if value > vmax * 0.55 else "#1a1a1a")
     if title:
-        ax.set_title(title, pad=6)
+        set_figure_title(ax, title, pad=6)
     cbar = ax.figure.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
     cbar.set_label(cbar_label, fontsize=7)
     cbar.ax.tick_params(labelsize=6.5)
@@ -1190,6 +1598,36 @@ def save_paper_pdf(fig, out_path: Path) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(str(out_path), format="pdf", bbox_inches="tight", pad_inches=0.02)
     return out_path
+
+
+def _tuck_overflowing_value_labels(ax, labels) -> None:
+    """Move a bar's value label inside the bar when it would run past the axes ceiling.
+
+    A rotated "100" above a bar that already reaches 100 can be taller than the headroom, and
+    with `clip_on` it prints as "10". Labels that do not fit above their bar are set just
+    inside it instead, in whichever of black or white reads on that bar's colour. Values,
+    limits and type sizes are untouched, and a label that fits above its bar does not move.
+    """
+    if not labels:
+        return
+    import matplotlib.colors as mcolors  # noqa: WPS433
+
+    fig = ax.figure
+    fig.canvas.draw()
+    rend = fig.canvas.get_renderer()
+    to_data = ax.transData.inverted()
+    ceiling = ax.get_ylim()[1]
+    span = ceiling - ax.get_ylim()[0]
+    for artist, value, bar_color in labels:
+        bb = artist.get_window_extent(rend)
+        if to_data.transform((bb.x0, bb.y1))[1] <= ceiling - span * 0.005:
+            continue
+        red, green, blue = mcolors.to_rgb(bar_color)
+        luminance = 0.299 * red + 0.587 * green + 0.114 * blue
+        artist.set_va("top")
+        artist.set_position((artist.get_position()[0], value - span * 0.012))
+        artist.set_color("white" if luminance < 0.55 else "#1A1A1A")
+        artist.set_zorder(7)
 
 
 def draw_vertical_grouped_bars(
@@ -1228,6 +1666,7 @@ def draw_vertical_grouped_bars(
     group_width = 0.82
     bar_width = group_width / n_series
 
+    value_label_artists: List[Tuple[Any, float, str]] = []
     for idx, (label, values) in enumerate(series):
         offset = (idx - (n_series - 1) / 2.0) * bar_width
         color = _color_for(label)
@@ -1294,7 +1733,7 @@ def draw_vertical_grouped_bars(
                 if v <= 0:
                     continue
                 txt = f"{v:.0f}" if v >= 1 else f"{v:.1f}"
-                ax.text(
+                artist = ax.text(
                     x[j] + offset,
                     v + (4.5 if is_baseline else 0.8),
                     txt,
@@ -1306,6 +1745,7 @@ def draw_vertical_grouped_bars(
                     zorder=6,
                     clip_on=True,
                 )
+                value_label_artists.append((artist, v, color))
 
     ax.set_xticks(x)
     ax.set_xticklabels(list(categories))
@@ -1319,8 +1759,9 @@ def draw_vertical_grouped_bars(
     # in-plot legend, not for plotted data).
     tick_top = 100 if y_max > 100 else int(y_max)
     ax.set_yticks(range(0, tick_top + 1, 10))
+    _tuck_overflowing_value_labels(ax, value_label_artists)
     if title:
-        ax.set_title(title, pad=6)
+        set_figure_title(ax, title, pad=6)
     # Paper-style: keep all 4 spines for a full box around the plot.
     for spine in ax.spines.values():
         spine.set_linewidth(0.6)

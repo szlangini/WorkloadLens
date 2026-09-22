@@ -21,6 +21,9 @@ DATA_COLUMN_RECORD = "data_column_stats"
 DATA_HISTOGRAM_RECORD = "data_histogram_stats"
 DEFAULT_EXTENSIONS = (".tbl", ".csv", ".dat", ".parquet")
 DEFAULT_DELIMITER = "|"
+# Name-suffix fallback for key-column classification, used when no
+# referential-integrity DDL is available (see compute_column_mcv_metrics).
+KEY_NAME_SUFFIXES = ("_sk", "_id")
 
 _TEXT_TYPES = {"TEXT"}
 _NUMERIC_TYPES = {"INT", "DOUBLE", "DECIMAL"}
@@ -89,6 +92,13 @@ class DataProfile:
 
     def max_mcv_fractions(self) -> List[float]:
         return [metric.max_fraction for metric in self.columns if metric.row_count > 0]
+
+    def key_max_mcv_fractions(self) -> List[float]:
+        return [
+            metric.max_fraction
+            for metric in self.columns
+            if metric.row_count > 0 and metric.is_key_column
+        ]
 
     def null_fractions(self) -> List[float]:
         return [metric.null_fraction for metric in self.columns if metric.row_count > 0]
@@ -342,6 +352,18 @@ class ColumnMCVMetric:
     sample_fraction: Optional[float] = None
     is_primary_key: bool = False
     is_foreign_key: bool = False
+    # Mechanism that classified the column as a key: "ri" (referential-
+    # integrity DDL), "fk-ddl" (FOREIGN KEY in the table DDL), "suffix"
+    # (name-suffix fallback), "pk-ddl" (PRIMARY KEY in the table DDL), or
+    # None for non-key columns.
+    key_source: Optional[str] = None
+    # False for records read from scans that predate key tagging (no
+    # key_source field in the JSONL); is_key_column then falls back to the
+    # name-suffix heuristic. Not serialised.
+    key_tagged_scan: bool = True
+    # Rows-per-key fan-out summary for foreign-key columns
+    # (top1_share/top5_share/p50/p90/p99/max), None otherwise.
+    key_fanout: Optional[Dict[str, float]] = None
 
     def to_record(self) -> dict:
         return {
@@ -366,6 +388,8 @@ class ColumnMCVMetric:
             "sample_fraction": self.sample_fraction,
             "is_primary_key": self.is_primary_key,
             "is_foreign_key": self.is_foreign_key,
+            "key_source": self.key_source,
+            "key_fanout": self.key_fanout,
         }
 
     @classmethod
@@ -391,7 +415,24 @@ class ColumnMCVMetric:
             sample_fraction=_safe_optional_float(record.get("sample_fraction")),
             is_primary_key=bool(record.get("is_primary_key")),
             is_foreign_key=bool(record.get("is_foreign_key")),
+            key_source=(str(record.get("key_source")) if record.get("key_source") else None),
+            key_tagged_scan="key_source" in record,
+            key_fanout=(dict(record["key_fanout"]) if isinstance(record.get("key_fanout"), dict) else None),
         )
+
+    @property
+    def is_key_column(self) -> bool:
+        """Whether the column is a key (primary or foreign) column.
+
+        Records from scans that predate key tagging carry no key_source field;
+        for those the documented name-suffix fallback (KEY_NAME_SUFFIXES)
+        applies so older data_metrics.jsonl files still get a usable split.
+        """
+        if self.is_primary_key or self.is_foreign_key:
+            return True
+        if self.key_tagged_scan:
+            return False
+        return _has_key_name_suffix(self.column)
 
     @property
     def null_fraction(self) -> float:
@@ -537,7 +578,11 @@ def compute_column_mcv_metrics(
     logger: Optional[Callable[[str], None]] = None,
     sample_fraction: Optional[float] = None,
     threads: Optional[int] = None,
+    ri_foreign_keys: Optional[Dict[str, set]] = None,
 ) -> Tuple[List[ColumnMCVMetric], List[ColumnHistogramMetric]]:
+    # ri_foreign_keys ({table: {column, ...}}, from a referential-integrity
+    # DDL) tags foreign-key columns precisely; when it is None, the documented
+    # KEY_NAME_SUFFIXES fallback tags key-like columns instead.
     if requested_k <= 0:
         raise ValueError("requested_k must be greater than zero")
 
@@ -631,7 +676,29 @@ def compute_column_mcv_metrics(
                     distinct_count = int(distinct_row[0]) if distinct_row and distinct_row[0] is not None else 0
                     column_type = (table_meta.columns.get(column_name) or "").upper()
                     is_primary_key = column_name in (table_meta.primary_key_columns or {})
-                    is_foreign_key = column_name in (table_meta.foreign_key_columns or {})
+                    ddl_foreign = column_name in (table_meta.foreign_key_columns or {})
+                    ri_foreign = ri_foreign_keys is not None and column_name in ri_foreign_keys.get(table_name, ())
+                    # Suffix fallback only when no RI schema was provided, and
+                    # never re-tags a declared primary key as foreign.
+                    suffix_foreign = (
+                        ri_foreign_keys is None and not is_primary_key and _has_key_name_suffix(column_name)
+                    )
+                    is_foreign_key = ddl_foreign or ri_foreign or suffix_foreign
+                    if ri_foreign:
+                        key_source = "ri"
+                    elif ddl_foreign:
+                        key_source = "fk-ddl"
+                    elif suffix_foreign:
+                        key_source = "suffix"
+                    elif is_primary_key:
+                        key_source = "pk-ddl"
+                    else:
+                        key_source = None
+                    key_fanout = None
+                    if is_foreign_key:
+                        key_fanout = _compute_key_fanout(
+                            con, sample_table, ident, freqs, max(total_rows - null_count, 0)
+                        )
                     mean_run_length = _compute_mean_run_length(con, sample_table, ident)
                     is_sorted = (
                         _compute_sorted_flag(con, sample_table, ident) if column_type in _ORDERABLE_TYPES else None
@@ -667,6 +734,8 @@ def compute_column_mcv_metrics(
                         sample_fraction=applied_sample_fraction,
                         is_primary_key=is_primary_key,
                         is_foreign_key=is_foreign_key,
+                        key_source=key_source,
+                        key_fanout=key_fanout,
                     )
                     metrics.append(mcv_metric)
                     histogram_metric = _compute_histogram_metric(
@@ -1030,6 +1099,50 @@ def _load_table_relation(
         return con.sql(fallback_query)
 
 
+def _compute_key_fanout(
+    con: duckdb.DuckDBPyConnection,
+    source_table: str,
+    ident: str,
+    top_frequencies: Sequence[int],
+    non_null_rows: int,
+) -> Optional[Dict[str, float]]:
+    """Rows-per-key fan-out summary for a foreign-key column.
+
+    No published fleet reference exists for this signal; it is meant for
+    benchmark-vs-benchmark comparison of join fan-out.
+    """
+    if non_null_rows <= 0 or not top_frequencies:
+        return None
+    query = f"""
+        WITH per_key AS (
+            SELECT COUNT(*) AS cnt
+            FROM {source_table}
+            WHERE {ident} IS NOT NULL
+            GROUP BY {ident}
+        )
+        SELECT
+            quantile_cont(cnt, 0.50),
+            quantile_cont(cnt, 0.90),
+            quantile_cont(cnt, 0.99),
+            MAX(cnt)
+        FROM per_key
+    """
+    try:
+        row = con.execute(query).fetchone()
+    except duckdb.Error:
+        return None
+    if not row or row[3] is None:
+        return None
+    return {
+        "top1_share": top_frequencies[0] / non_null_rows,
+        "top5_share": sum(top_frequencies[:5]) / non_null_rows,
+        "p50": float(row[0]),
+        "p90": float(row[1]),
+        "p99": float(row[2]),
+        "max": int(row[3]),
+    }
+
+
 def _compute_mean_run_length(con: duckdb.DuckDBPyConnection, source_table: str, ident: str) -> Optional[float]:
     query = f"""
         WITH ordered AS (
@@ -1306,6 +1419,10 @@ def _safe_optional_float(value: object) -> Optional[float]:
     if value is None:
         return None
     return _safe_float(value, default=0.0)
+
+
+def _has_key_name_suffix(column_name: str) -> bool:
+    return (column_name or "").lower().endswith(KEY_NAME_SUFFIXES)
 
 
 def _quote_identifier(name: str) -> str:

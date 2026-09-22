@@ -135,6 +135,37 @@ Most-Common-Value analysis per column:
 
 MCV dominance reveals skew: a column where the top-5 values account for 90% of rows behaves very differently from a uniform column under aggregation and join operators.
 
+#### Key/non-key column split
+
+Every `data_column_stats` record carries a key classification
+(`is_primary_key`, `is_foreign_key`, `key_source`), so MCV signals can be
+reported over key (PK/FK) columns only — the population that join-key skew
+actually lands on. The classification mechanism is recorded in `key_source`:
+
+| `key_source` | Mechanism |
+|---|---|
+| `pk-ddl` | `PRIMARY KEY` constraint in the table DDL (`--schema`) |
+| `fk-ddl` | `FOREIGN KEY` constraint in the table DDL |
+| `ri` | Referential-integrity DDL passed via `--ri-schema` (e.g. TPC-DS `tpcds_ri.sql`) |
+| `suffix` | Name-suffix fallback: columns ending in `_sk` / `_id` |
+| `null` | Non-key column |
+
+The suffix fallback applies only when no `--ri-schema` is given, and never
+re-tags a declared primary key as foreign. It exists so third-party schemas
+without RI DDLs still get a usable split; schemas with other key naming
+conventions (e.g. TPC-H's `*key` columns) need an RI DDL for a correct split.
+Records produced before key tagging existed (no `key_source` field in the
+JSONL) are classified downstream via the same suffix fallback.
+
+#### Join fan-out
+
+For each foreign-key column, the record additionally carries a `key_fanout`
+summary of the rows-per-key distribution: `top1_share` and `top5_share`
+(fraction of non-NULL rows held by the most common 1/5 keys) and
+`p50`/`p90`/`p99`/`max` rows per key. No published production reference exists
+for this signal; it is intended for benchmark-vs-benchmark comparison of join
+fan-out.
+
 ### 2.4 String Length Statistics
 
 Per string column:

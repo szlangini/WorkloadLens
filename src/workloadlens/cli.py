@@ -36,7 +36,7 @@ from .coverage.types_ast import (
     compute_filter_predicate_depth,
     detect_limit_clause,
 )
-from .utils.schema import parse_schema_types, parse_schema_tables
+from .utils.schema import parse_schema_types, parse_schema_tables, parse_ri_foreign_key_columns
 from .utils.math import counter_shares
 from .utils.sqlcleanup import normalize_sql_dialect, classify_statement_type
 from .report import (
@@ -882,6 +882,15 @@ def data_command(
     schema: Optional[Path] = typer.Option(
         None, "--schema", help="Schema DDL used to map columns when collecting per-column stats."
     ),
+    ri_schema: Optional[Path] = typer.Option(
+        None,
+        "--ri-schema",
+        help=(
+            "Referential-integrity DDL (ALTER TABLE ... FOREIGN KEY) used to tag "
+            "foreign-key columns for the key/non-key column split. Without it, a "
+            "name-suffix fallback (_sk/_id) tags key-like columns."
+        ),
+    ),
     column_stats: bool = typer.Option(
         False,
         "--column-stats/--no-column-stats",
@@ -956,6 +965,19 @@ def data_command(
                 )
         schema_sql = read_text(schema)
         schema_tables = parse_schema_tables(schema_sql)
+        ri_foreign_keys = None
+        if ri_schema is not None:
+            ri_foreign_keys = parse_ri_foreign_key_columns(read_text(ri_schema))
+            fk_count = sum(len(columns) for columns in ri_foreign_keys.values())
+            if fk_count:
+                console.print(
+                    f"[green]Tagged {fk_count} foreign-key column(s) across "
+                    f"{len(ri_foreign_keys)} table(s) from RI schema.[/green]"
+                )
+            else:
+                console.print(
+                    f"[yellow]No FOREIGN KEY constraints found in RI schema {ri_schema}.[/yellow]"
+                )
         table_files = list_data_files(source, extensions=exts, recursive=recursive)
         column_metrics, histogram_metrics = compute_column_mcv_metrics(
             table_files,
@@ -965,6 +987,7 @@ def data_command(
             null_marker=null_marker,
             sample_fraction=sample_fraction,
             threads=worker_threads,
+            ri_foreign_keys=ri_foreign_keys,
         )
         if column_metrics:
             table_count = len({metric.table for metric in column_metrics if getattr(metric, "table", None)})

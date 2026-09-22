@@ -74,6 +74,43 @@ def parse_schema_tables(sql: str) -> Dict[str, SchemaTableMetadata]:
     return tables
 
 
+def parse_ri_foreign_key_columns(sql: str) -> Dict[str, set]:
+    """
+    Parse FOREIGN KEY constraints from a referential-integrity DDL and return
+    a mapping {table_name_lower: {referencing_column_lower, ...}}.
+
+    Supports the ``ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY (...)
+    REFERENCES ...`` form used by the TPC tooling (e.g. tpcds_ri.sql) as well
+    as FOREIGN KEY constraints inside CREATE TABLE statements.
+    """
+    if not sql or not sql.strip():
+        return {}
+    try:
+        statements = sqlglot.parse(sql, error_level="ignore")
+    except Exception:
+        return {}
+
+    out: Dict[str, set] = defaultdict(set)
+    for statement in statements:
+        if statement is None:
+            continue
+        if isinstance(statement, exp.Alter):
+            table_expr = statement.this
+            table_name = table_expr.alias_or_name if isinstance(table_expr, exp.Table) else None
+        elif isinstance(statement, exp.Create):
+            table_name = _extract_table_name(statement)
+        else:
+            continue
+        if not table_name:
+            continue
+        for foreign_key in statement.find_all(exp.ForeignKey):
+            for entry in foreign_key.expressions or []:
+                name = _pk_column_name(entry)
+                if name:
+                    out[table_name.lower()].add(name)
+    return {table: columns for table, columns in out.items() if columns}
+
+
 def _extract_columns_and_primary_keys(
     statement: exp.Create,
 ) -> tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:

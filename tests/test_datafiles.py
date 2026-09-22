@@ -14,7 +14,7 @@ from workloadlens.datafiles import (
     scan_data_directory,
     compute_column_mcv_metrics,
 )
-from workloadlens.utils.schema import parse_schema_tables
+from workloadlens.utils.schema import parse_schema_tables, parse_ri_foreign_key_columns
 
 DUCKDB_AVAILABLE = importlib.util.find_spec("duckdb") is not None
 
@@ -244,3 +244,94 @@ def test_compute_column_mcv_metrics_with_sampling(tmp_path) -> None:
         [table_path], tables, requested_k=2, sample_fraction=sample_fraction
     )
     assert any(metric.sample_fraction == pytest.approx(sample_fraction) for metric in metrics)
+
+
+def test_parse_ri_foreign_key_columns() -> None:
+    ri_sql = """
+    alter table store_sales add constraint ss_d1 foreign key (ss_sold_date_sk) references date_dim (d_date_sk);
+    alter table store_sales add constraint ss_i foreign key (ss_item_sk) references item (i_item_sk);
+    -- alter table store_sales add constraint ss_x foreign key (ss_commented_sk) references item (i_item_sk);
+    CREATE TABLE web_sales (
+        ws_item_sk INT,
+        ws_order_number INT,
+        FOREIGN KEY (ws_item_sk) REFERENCES item (i_item_sk)
+    );
+    """
+    foreign_keys = parse_ri_foreign_key_columns(ri_sql)
+
+    assert foreign_keys["store_sales"] == {"ss_sold_date_sk", "ss_item_sk"}
+    assert foreign_keys["web_sales"] == {"ws_item_sk"}
+    assert parse_ri_foreign_key_columns("") == {}
+
+
+_KEY_SCHEMA_SQL = """
+CREATE TABLE sales (
+    s_item_sk INT,
+    s_order_id INT,
+    s_quantity INT,
+    primary key (s_item_sk)
+);
+"""
+
+
+@pytest.mark.skipif(not DUCKDB_AVAILABLE, reason="duckdb not installed")
+def test_compute_column_mcv_metrics_key_tagging_with_ri_schema(tmp_path) -> None:
+    table_path = tmp_path / "sales.tbl"
+    _make_file(table_path, ["1|10|5", "1|11|6", "2|10|7", "3|12|8"])
+
+    tables = parse_schema_tables(_KEY_SCHEMA_SQL)
+    ri_foreign_keys = parse_ri_foreign_key_columns(
+        "alter table sales add constraint s_o foreign key (s_order_id) references orders (o_id);"
+    )
+    metrics, _ = compute_column_mcv_metrics(
+        [table_path], tables, requested_k=3, ri_foreign_keys=ri_foreign_keys
+    )
+    by_column = {metric.column: metric for metric in metrics}
+
+    order_metric = by_column["s_order_id"]
+    assert order_metric.is_foreign_key and order_metric.key_source == "ri"
+    assert order_metric.is_key_column
+    assert order_metric.key_fanout is not None
+    assert order_metric.key_fanout["top1_share"] == pytest.approx(0.5)
+    assert order_metric.key_fanout["max"] == 2
+
+    item_metric = by_column["s_item_sk"]
+    assert item_metric.is_primary_key and not item_metric.is_foreign_key
+    assert item_metric.key_source == "pk-ddl"
+    assert item_metric.is_key_column
+
+    quantity_metric = by_column["s_quantity"]
+    assert not quantity_metric.is_key_column and quantity_metric.key_source is None
+    assert quantity_metric.key_fanout is None
+
+
+@pytest.mark.skipif(not DUCKDB_AVAILABLE, reason="duckdb not installed")
+def test_compute_column_mcv_metrics_key_suffix_fallback(tmp_path) -> None:
+    table_path = tmp_path / "sales.tbl"
+    _make_file(table_path, ["1|10|5", "2|10|6"])
+
+    tables = parse_schema_tables(_KEY_SCHEMA_SQL)
+    metrics, _ = compute_column_mcv_metrics([table_path], tables, requested_k=2)
+    by_column = {metric.column: metric for metric in metrics}
+
+    # Without an RI schema the documented _sk/_id suffix fallback applies,
+    # but declared primary keys keep their pk-ddl source.
+    assert by_column["s_order_id"].key_source == "suffix"
+    assert by_column["s_order_id"].is_foreign_key
+    assert by_column["s_item_sk"].key_source == "pk-ddl"
+    assert not by_column["s_item_sk"].is_foreign_key
+    assert by_column["s_quantity"].key_source is None
+
+    # Round trip: key fields survive to_record -> from_record.
+    from workloadlens.datafiles import ColumnMCVMetric
+
+    restored = ColumnMCVMetric.from_record(by_column["s_order_id"].to_record())
+    assert restored.key_source == "suffix" and restored.key_tagged_scan
+    assert restored.key_fanout == by_column["s_order_id"].key_fanout
+
+    # Legacy records (no key_source field) fall back to the name suffix.
+    legacy_record = by_column["s_order_id"].to_record()
+    del legacy_record["key_source"]
+    legacy_record["is_foreign_key"] = False
+    legacy = ColumnMCVMetric.from_record(legacy_record)
+    assert not legacy.key_tagged_scan and legacy.is_key_column

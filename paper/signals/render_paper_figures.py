@@ -8,6 +8,7 @@ PAPER ARTIFACT MAP (what each output reproduces in the manuscript):
   Figure 2b  Aggregate-input logical types . fig_aggregate_logical_types.{pdf,png}
   Figure 3a  NULL fraction CDF ............. fig_null_fraction_cdf.{pdf,png}
   Figure 3b  MCV share CDF ................. fig_mcv_share_cdf.{pdf,png}
+             MCV share CDF, key cols only .. fig_mcv_share_cdf_keys.{pdf,png}
   Figure 6a  Schema column types .......... fig_schema_column_types.{pdf,png}
   Figure 6b  GROUP BY key count ........... fig_group_by_key_count.{pdf,png}
   Table 3    LIMIT magnitude (no ORDER BY) . table3_limit_magnitude.{tex,md,csv}
@@ -27,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -35,6 +37,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 from workloadlens.report import paper
+
+# The paper's figures sit under LaTeX captions that already name them, so an in-figure
+# header repeats the caption -- reviewer D3(d) of the July 2026 round. That is a property
+# of THIS script, not of WorkloadLens: the library draws titles by default, because a plot
+# read on its own has nothing else to say what it shows. So the paper renderer turns them
+# off for itself, and leaves an explicit PLOT_TITLES or the legacy style to win.
+if not paper.LEGACY_STYLE and "PLOT_TITLES" not in os.environ:
+    paper.set_figure_titles_enabled(False)
 from workloadlens.report.aggregate import aggregate_labeled_jsonl
 
 # paper/signals/render_paper_figures.py  ->  paper/
@@ -65,7 +75,22 @@ LABEL_BY_KEY = dict(BENCHES_7)
 # Data-side figures (NULL CDF, MCV CDF): JCC-H gets its own entry, sourced from
 # the skewed (-k) data scan in analyses/jcch_skewed/. Its contribution is
 # data-value skew, invisible to AST signals but measurable on per-column MCV.
-BENCHES_8_DATA = BENCHES_7 + [("jcch_skewed", "JCC-H")]
+#
+# RedBench is kept OUT, the mirror image of the JCC-H rule above: it is a query
+# workload (1,000 queries) over the IMDb database that JOB also uses — its
+# data_dir is a symlink to JOB's — so its per-column scan is byte-identical to
+# JOB's and it would draw an indistinguishable second JOB line. Reviewer D9 of
+# the July 2026 round hit exactly this ("the legend of Figure 3 includes JOB,
+# but it is difficult to identify the corresponding curve"): the JOB curve was
+# drawn underneath RedBench. RedBench stays in every query-shape figure, where
+# its 1,000 queries differ from JOB's 113.
+DATA_SIDE_SHARED_WITH: Dict[str, str] = {"redbench": "job"}
+# PLOT_LEGACY_STYLE=1 puts RedBench back, i.e. reproduces the pre-review figure in which
+# its curve sits invisibly underneath JOB. For side-by-side comparison only.
+if paper.LEGACY_STYLE:
+    DATA_SIDE_SHARED_WITH = {}
+BENCHES_8_DATA = [b for b in BENCHES_7 if b[0] not in DATA_SIDE_SHARED_WITH] + [("jcch_skewed", "JCC-H")]
+DATA_SIDE_OMITTED_LABELS = [lbl for key, lbl in BENCHES_7 if key in DATA_SIDE_SHARED_WITH]
 BENCH_KEYS_8_DATA = [k for k, _ in BENCHES_8_DATA]
 BENCH_LABELS_8_DATA = [v for _, v in BENCHES_8_DATA]
 
@@ -302,7 +327,10 @@ def render_cdf_figure(
     legend_loc: str = "upper left",
     legend_ncol: int = 3,
     legend_fontsize: float | None = None,
+    note_fontsize: float | None = None,
     fig_height: float = 2.8,
+    baseline_label: str = "Redshift",
+    baseline_note: str | None = None,
 ) -> Path:
     workloads = _load_workloads()
     series: List[Tuple[str, List[float], List[float]]] = []
@@ -321,9 +349,22 @@ def render_cdf_figure(
         series.append((label, xs, ys))
     bxs, bys = _redshift_overlay(csv_path)
     if bxs:
-        series.append(("Redshift", bxs, bys))
+        series.append((baseline_label, bxs, bys))
 
-    note = f"Omitted (all-zero): {', '.join(zero_benches)}" if zero_benches else None
+    # One paragraph per reason, each starting on its own line, so the two kinds of omission
+    # stay legible instead of running together in one ruled-off sentence. The wording is the
+    # short form: these are set below the series labels and wrapped to the label grid's
+    # width, and a semicolon-joined single string is what used to stretch the box across the
+    # plot and cover the curves underneath it.
+    notes: List[str] = []
+    if bxs and baseline_note:
+        notes.append(f"{baseline_note}.")
+    if zero_benches:
+        notes.append(f"Omitted, all-zero: {', '.join(zero_benches)}.")
+    if DATA_SIDE_OMITTED_LABELS:
+        shared = ", ".join(DATA_SIDE_OMITTED_LABELS)
+        notes.append(f"Omitted, same data as JOB: {shared}.")
+    note = notes or None
 
     fig, ax = plt.subplots(figsize=(paper.TWO_COL_WIDTH_IN, fig_height))
     paper.draw_multi_line_cdf(
@@ -331,6 +372,7 @@ def render_cdf_figure(
         legend=True,
         legend_loc=legend_loc, legend_ncol=legend_ncol,
         legend_fontsize=legend_fontsize,
+        note_fontsize=note_fontsize,
         extra_legend_note=note,
     )
     out_path = OUT_DIR / f"{name}.pdf"
@@ -457,6 +499,28 @@ def _l1_distance(a: Sequence[float], b: Sequence[float]) -> float:
     return sum(abs(float(a[i]) - float(b[i])) for i in range(n)) / n
 
 
+# ── MCV denominator ───────────────────────────────────────────────────────────
+# Van Renen et al. §5.3 describes Figure 9 as fractions OF ROWS, aggregate_signals.py
+# computes max_count / row_count, the exported CSV buckets use rows, the Redshift baseline
+# curve is built from those buckets, and the manuscript already defines it that way. The
+# library's `max_fraction` instead divides by non-NULL rows, so drawing the benchmark curves
+# from it put two conventions inside one plot: at the >=50% threshold Prod-DS is 178/429
+# (41.49%) on rows and 214/429 (49.88%) on non-NULL rows. These helpers keep everything on
+# rows. `null_fractions()` already uses rows, so it is unchanged.
+def _mcv_fractions_all_rows(profile, keys: str = "all") -> List[float]:
+    """max_count / row_count per column. `keys` is all | only | exclude."""
+    out: List[float] = []
+    for m in profile.columns:
+        if m.row_count <= 0:
+            continue
+        if keys == "only" and not m.is_key_column:
+            continue
+        if keys == "exclude" and m.is_key_column:
+            continue
+        out.append(m.max_count / m.row_count)
+    return out
+
+
 def _jcch_skewed_cdf_row(signal_csv: str) -> List[float] | None:
     workloads = _load_workloads()
     report = workloads.get("JCC-H")
@@ -466,7 +530,7 @@ def _jcch_skewed_cdf_row(signal_csv: str) -> List[float] | None:
     if "null" in signal_csv:
         values = profile.null_fractions()
     elif "mcv" in signal_csv:
-        values = profile.max_mcv_fractions()
+        values = _mcv_fractions_all_rows(profile)
     else:
         return None
     if not values:
@@ -474,6 +538,17 @@ def _jcch_skewed_cdf_row(signal_csv: str) -> List[float] | None:
     thresholds = [0.01, 0.10, 0.30, 0.50, 0.70, 0.90]
     n = len(values)
     return [round(100.0 * sum(1 for v in values if v >= t) / n, 2) for t in thresholds]
+
+
+def _mean_available(row: Sequence[float]) -> float:
+    """Mean over the signals a benchmark actually has, skipping NaN gaps.
+
+    A gap means the signal is not measurable for that benchmark (see
+    DATA_SIDE_SHARED_WITH), not that it scored zero; averaging a gap as 0 would
+    flatter the benchmark.
+    """
+    vals = [float(v) for v in row if v == v]          # v != v  <=> NaN
+    return sum(vals) / len(vals) if vals else 0.0
 
 
 def _compute_distance_matrix() -> Tuple[List[str], List[str], List[List[float]]]:
@@ -492,6 +567,11 @@ def _compute_distance_matrix() -> Tuple[List[str], List[str], List[List[float]]]
             if baseline_vec is None:
                 row.append(0.0)
                 continue
+            if key in DATA_SIDE_SHARED_WITH and ("null" in fname or "mcv" in fname):
+                # RedBench reads JOB's IMDb data (see DATA_SIDE_SHARED_WITH), so a
+                # value here would repeat JOB's, not measure RedBench. Leave a gap.
+                row.append(float("nan"))
+                continue
             if key == "jcch" and ("null" in fname or "mcv" in fname):
                 bench_vec = _jcch_skewed_cdf_row(fname)
                 if bench_vec is None:
@@ -508,7 +588,7 @@ def _compute_distance_matrix() -> Tuple[List[str], List[str], List[List[float]]]
 
 def render_distance_summary_A() -> Path:
     bench_labels, _signal_labels, distances = _compute_distance_matrix()
-    means = [sum(row) / len(row) if row else 0.0 for row in distances]
+    means = [_mean_available(row) for row in distances]
     paired = sorted(zip(bench_labels, means), key=lambda p: p[1])
     sorted_labels = [p[0] for p in paired]
     sorted_means = [p[1] for p in paired]
@@ -528,11 +608,12 @@ def render_distance_summary_A() -> Path:
 
 def render_distance_summary_B() -> Path:
     bench_labels, signal_labels, distances = _compute_distance_matrix()
-    means = [sum(row) / len(row) if row else 0.0 for row in distances]
+    means = [_mean_available(row) for row in distances]
     order = sorted(range(len(bench_labels)), key=lambda i: means[i])
     benches = [bench_labels[i] for i in order]
     dist_by_bench = [distances[i] for i in order]
-    x_max = max((max(row) for row in distances if row), default=1.0) * 1.12
+    _finite = [v for row in distances for v in row if v == v]
+    x_max = (max(_finite) if _finite else 1.0) * 1.12
 
     ncols, nrows = 4, 2
     fig, axes = plt.subplots(nrows, ncols,
@@ -550,11 +631,19 @@ def render_distance_summary_B() -> Path:
             x_max=x_max,
             title=signal,
         )
-    fig.suptitle(
+    paper.set_figure_title(
+        fig,
         "Per-Signal L1 Distance to Production (Lower = Closer; PROD-DS hatched)",
         fontsize=10, fontweight="bold",
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    if DATA_SIDE_OMITTED_LABELS:
+        fig.text(
+            0.5, 0.005,
+            f"{', '.join(DATA_SIDE_OMITTED_LABELS)}: no bar on NULL fraction and MCV share — "
+            f"it reads JOB's IMDb data, so those two signals are JOB's, not its own.",
+            ha="center", va="bottom", fontsize=7.5, color="#444444",
+        )
+    fig.tight_layout(rect=(0, 0, 1, 0.95 if paper.SHOW_FIGURE_TITLES else 1.0))
     out_path = OUT_DIR / "fig_production_distance_summary_B.pdf"
     paper.save_paper_pdf(fig, out_path)
     plt.close(fig)
@@ -563,7 +652,7 @@ def render_distance_summary_B() -> Path:
 
 def render_distance_summary_C() -> Path:
     bench_labels, signal_labels, distances = _compute_distance_matrix()
-    means = [sum(row) / len(row) if row else 0.0 for row in distances]
+    means = [_mean_available(row) for row in distances]
     order = sorted(range(len(bench_labels)), key=lambda i: means[i])
     bench_sorted = [bench_labels[i] for i in order]
     dist_sorted = [distances[i] for i in order]
@@ -632,13 +721,38 @@ def main(argv=None) -> int:
     # Figure 3b — MCV share CDF.
     path = render_cdf_figure(
         "fig_mcv_share_cdf",
-        lambda profile: profile.max_mcv_fractions(),
+        lambda profile: _mcv_fractions_all_rows(profile),
         DATA_DIR / "mcv_share_distribution.csv",
         title="MCV Share Distribution",
         ylabel="MCV share (%)",
         legend_loc="upper left",
         legend_ncol=2,
         legend_fontsize=7.0,
+        # Figure 6's two panels sit side by side, and the NULL panel's note is 7.65 pt. This
+        # panel's series labels are 7.0 pt, so the usual 85 % rule would set its note at
+        # 5.95 pt and the pair would not match. Fixed absolutely instead; the series labels
+        # keep their own size, and the note still wraps inside the label grid's width.
+        note_fontsize=7.65,
+    )
+    written.append(path)
+    print(f"  {path.name:50s} {path.stat().st_size:>7d} B")
+
+    # Figure 3b key-only variant — MCV share CDF over key (PK/FK) columns.
+    # Fleet reference = the same Fig 9 curve, transferred per Redset Table 7
+    # (see production_baselines.yaml). Benchmark curves, the exported CSV buckets
+    # and the fleet baseline now all use max_count / row_count, so one convention
+    # holds across the whole figure.
+    path = render_cdf_figure(
+        "fig_mcv_share_cdf_keys",
+        lambda profile: _mcv_fractions_all_rows(profile, keys="only"),
+        DATA_DIR / "mcv_share_distribution_keys.csv",
+        title="MCV Share Distribution (Key Columns)",
+        ylabel="MCV share (%)",
+        legend_loc="upper left",
+        legend_ncol=2,
+        legend_fontsize=7.0,
+        baseline_label="Amazon Redshift (all columns)",
+        baseline_note="Fleet curve = all columns, not measured key columns",
     )
     written.append(path)
     print(f"  {path.name:50s} {path.stat().st_size:>7d} B")

@@ -229,6 +229,31 @@ signals:
           ">=0.70": 33
           ">=0.90": 25
 
+  # ===== MCV share distribution — KEY (PK/FK) columns only =====
+  # Reference curve for the key-column split of the MCV signal. The Redshift
+  # fleet study reports no key-only MCV CDF; the transfer argument is Redset
+  # Table 7: predicate columns (~10 % of stored columns) are distributed
+  # "fairly similar to the stored data distribution" -> the key-column
+  # reference curve is the SAME fleet curve as Fig 9 (all columns).
+  mcv_share_distribution_keys:
+    description: "Share of key (PK/FK) columns whose max single-value frequency is >= threshold."
+    buckets: [">=0.01", ">=0.10", ">=0.30", ">=0.50", ">=0.70", ">=0.90"]
+    sources:
+      redshift:
+        ref: "Redshift [30]"
+        paper: "van Renen et al., Why TPC Is Not Enough (Redset), PVLDB 17(11):3694, 2024"
+        where: "Fig 9 middle panel (Fleet curve), transferred to key columns via Table 7"
+        method: chart-pixel-extracted (Fig 9) + distribution transfer (Table 7)
+        # Table 7 states predicate columns follow the stored-data distribution,
+        # so the all-columns fleet values apply unchanged to the key subset.
+        values:
+          ">=0.01": 73
+          ">=0.10": 60
+          ">=0.30": 49
+          ">=0.50": 41
+          ">=0.70": 33
+          ">=0.90": 25
+
   # ===== Statement-type mix =====
   # Re-sourced (2026-06-02) to the PRIMARY Redset Table 2 fleet numbers
   # (was RedBench-derived SELECT-73% analytic subset).

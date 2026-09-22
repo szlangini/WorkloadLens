@@ -107,6 +107,16 @@ workloadlens compare \
 | `reports/workloadlens_report.pdf` | Visual summary with tables, histograms, and percentile plots |
 | `report.json` (via `--json-out`) | Machine-readable aggregate of all metrics |
 
+### Figure headers
+
+Plots carry a header naming what they show — a WorkloadLens figure is usually read on
+its own, in a report or a slide, where nothing else says it. Set **`PLOT_TITLES=0`**
+(also `false`, `no`, `off`) to suppress them, which is what you want when the figure
+goes under a caption that already names it; the paper renderer under `paper/signals/`
+does that for itself. `PLOT_LEGACY_STYLE=1` renders the pre-July-2026 look and always
+keeps headers. Panel labels inside a small-multiple grid are unaffected either way:
+they say which signal a panel shows and are content, not a repeated caption.
+
 ## Documentation
 
 - [docs/signals.md](docs/signals.md) -- Signal categories and metric definitions

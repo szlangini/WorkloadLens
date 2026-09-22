@@ -36,8 +36,12 @@ PAPER_DIR = Path(__file__).resolve().parent.parent
 # derivative and CAB as a multi-tenant cloud workload outside the data-/query-
 # level scope. JCC-H's *skewed* data scan (analyses/jcch_skewed) is consumed
 # directly by the renderer for the MCV curve, so it needs no CSV row here.
+# `jcch` is the uniform JCC-H scan and `jcch_skewed` the skewed one. The data-side FIGURES
+# plot the skewed variant (render_paper_figures.BENCHES_8_DATA), so it must have a row of its
+# own here -- otherwise the only JCC-H row in the CSV describes data the figure does not show.
+# At the >=50% threshold the two differ: uniform 3/61 = 4.92%, skewed 4/61 = 6.56%.
 DEFAULT_BENCH_ORDER = [
-    "tpcds", "tpch", "dsb", "jcch", "job", "clickbench", "redbench", "prodds",
+    "tpcds", "tpch", "dsb", "jcch", "jcch_skewed", "job", "clickbench", "redbench", "prodds",
 ]
 
 # Set from CLI args in main(); the writer functions read these as globals so the
@@ -59,6 +63,7 @@ _YAML_KEY_MAP = {
     "limit_magnitude":                 "limit_magnitude",
     "null_fraction_distribution":      "null_fraction_distribution",
     "mcv_share_distribution":          "mcv_share_distribution",
+    "mcv_share_distribution_keys":     "mcv_share_distribution_keys",
     "statement_type_mix":              "statement_type_mix",
 }
 
@@ -240,11 +245,28 @@ def bucket_int(value: int, ranges: List[Tuple[int, str]], overflow: str) -> str:
     return overflow
 
 
+def _is_key_column(rec: dict) -> bool:
+    """Key (PK/FK) classification of a data_column_stats record.
+
+    Mirrors ColumnMCVMetric.is_key_column in the WorkloadLens package (kept
+    dependency-free here): records from scans that predate key tagging carry
+    no ``key_source`` field; for those the documented name-suffix fallback
+    (``_sk`` / ``_id``) applies. Records from tagged scans are authoritative.
+    """
+    if rec.get("is_primary_key") or rec.get("is_foreign_key"):
+        return True
+    if "key_source" in rec:
+        return False
+    return (rec.get("column") or "").lower().endswith(("_sk", "_id"))
+
+
 def aggregate_data_signals(data_records: List[dict]) -> dict:
     """Aggregate per-column data records into per-benchmark column-level signals."""
     columns_seen = 0
     null_fractions: List[float] = []
     mcv_shares: List[float] = []
+    mcv_shares_keys: List[float] = []
+    mcv_shares_nonkey: List[float] = []
     schema_types = Counter()
     string_lengths: List[float] = []
     pk_columns = 0
@@ -261,6 +283,13 @@ def aggregate_data_signals(data_records: List[dict]) -> dict:
         mc = (rec.get("max_count") or 0) / rows
         null_fractions.append(nf)
         mcv_shares.append(mc)
+        # Key/non-key split partitions the same values as mcv_shares (same
+        # max_count / row_count denominator convention), so the keys and
+        # nonkey rows sum consistently with the all-columns row.
+        if _is_key_column(rec):
+            mcv_shares_keys.append(mc)
+        else:
+            mcv_shares_nonkey.append(mc)
         schema_types[normalise_type(rec.get("column_type") or "")] += 1
         if rec.get("string_avg_length") is not None:
             string_lengths.append(rec["string_avg_length"])
@@ -274,9 +303,12 @@ def aggregate_data_signals(data_records: List[dict]) -> dict:
         "schema_types": dict(schema_types),
         "null_fractions": null_fractions,
         "mcv_shares": mcv_shares,
+        "mcv_shares_keys": mcv_shares_keys,
+        "mcv_shares_nonkey": mcv_shares_nonkey,
         "string_lengths": string_lengths,
         "pk_columns": pk_columns,
         "fk_columns": fk_columns,
+        "key_columns": len(mcv_shares_keys),
     }
 
 
@@ -319,6 +351,8 @@ def run(analyses: Path, out: Path, bench_order: List[str]) -> None:
     write_csv_features(summary)
     write_csv_null_distribution(summary)
     write_csv_mcv_distribution(summary)
+    write_csv_mcv_distribution_keys(summary)
+    write_csv_mcv_distribution_nonkey(summary)
     write_summary_json(summary)
     print(f"[ok] wrote signal tables to {out}")
 
@@ -426,9 +460,11 @@ def _distribution_csv(summary, attr: str, baseline_key: str, fname: str):
     rows = ["bench," + ",".join(header_labels) + ",columns"]
     for bench in BENCH_ORDER:
         vals = summary[bench]["data"].get(attr, [])
-        n = len(vals) or 1
-        cells = [f"{sum(1 for v in vals if v >= t) / n * 100:.2f}" for t in thresholds]
-        rows.append(f"{bench}," + ",".join(cells) + f",{n}")
+        denom = len(vals) or 1
+        cells = [f"{sum(1 for v in vals if v >= t) / denom * 100:.2f}" for t in thresholds]
+        # Report the true column count (0 for an empty pool, e.g. a benchmark
+        # without any tagged key columns); denom only guards the division.
+        rows.append(f"{bench}," + ",".join(cells) + f",{len(vals)}")
     src = PROD_BASELINE.get(baseline_key, {})
     for source_label, values in src.items():
         cells = [f"{values.get(lbl, 0.0):.2f}" for lbl in bucket_labels]
@@ -446,6 +482,21 @@ def write_csv_mcv_distribution(summary):
                       "mcv_share_distribution.csv")
 
 
+def write_csv_mcv_distribution_keys(summary):
+    # Key (PK/FK) columns only; the fleet reference curve is the same Fig 9
+    # curve as the all-columns baseline (Redset Table 7: predicate columns are
+    # distributed "fairly similar to the stored data distribution").
+    _distribution_csv(summary, "mcv_shares_keys", "mcv_share_distribution_keys",
+                      "mcv_share_distribution_keys.csv")
+
+
+def write_csv_mcv_distribution_nonkey(summary):
+    # Complement of the keys split; no published production reference exists
+    # for non-key columns, so this CSV carries no baseline row.
+    _distribution_csv(summary, "mcv_shares_nonkey", "mcv_share_distribution_nonkey",
+                      "mcv_share_distribution_nonkey.csv")
+
+
 def write_summary_json(summary):
     out = OUT / "summary.json"
 
@@ -454,6 +505,8 @@ def write_summary_json(summary):
         # Truncate raw arrays to keep summary small.
         d.pop("null_fractions", None)
         d.pop("mcv_shares", None)
+        d.pop("mcv_shares_keys", None)
+        d.pop("mcv_shares_nonkey", None)
         d.pop("string_lengths", None)
         return d
 
